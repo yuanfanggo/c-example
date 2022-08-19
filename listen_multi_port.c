@@ -71,7 +71,7 @@ int main(int argc, char *argv[])
 		}
 
 		// Now server is ready to listen and verification
-		if ((listen(sockfd[i], 5)) != 0)
+		if ((listen(sockfd[i], 100)) != 0)
 		{
 			printf("%d Listen failed. errno:%u, reason:%s\n", i + min_port, errno, strerror(errno));
 			continue;
