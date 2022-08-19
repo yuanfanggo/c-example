@@ -19,7 +19,7 @@ static void limit_set()
 		printf("RLIMIT_NOFILE rlim.rlim_max %lu\n", rlim.rlim_max);
 	}
 
-	rlim.rlim_cur = rlim.rlim_max;
+	rlim.rlim_cur = rlim.rlim_max = 655350;
 	if (setrlimit(RLIMIT_NOFILE, &rlim) == 0)
 	{
 		printf("RLIMIT_NOFILE rlim.rlim_cur %lu rlim.rlim_max %lu\n", rlim.rlim_cur, rlim.rlim_max);
