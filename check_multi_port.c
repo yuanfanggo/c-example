@@ -48,7 +48,7 @@ static void *myconnect(void *ptr)
 	struct sockaddr_in servaddr, cli;
 
 	port = *(uint16_t *)ptr;
-	printf("connected to port %d..\n", port);
+	//printf("connected to port %d..\n", port);
 
 	// socket create and verification
 	sockfd = socket(AF_INET, SOCK_STREAM, 0);
