@@ -5,12 +5,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 
-char *ip_addr = NULL;
+static char *ip_addr;
 
 static void limit_set()
 {
@@ -22,7 +24,7 @@ static void limit_set()
 		printf("RLIMIT_NOFILE nofile_rlim.rlim_cur %lu\n", nofile_rlim.rlim_cur);
 		printf("RLIMIT_NOFILE nofile_rlim.rlim_max %lu\n", nofile_rlim.rlim_max);
 	}
-	nofile_rlim.rlim_cur = nofile_rlim.rlim_max;
+	nofile_rlim.rlim_cur = nofile_rlim.rlim_max = 655350;
 	if (setrlimit(RLIMIT_NOFILE, &nofile_rlim) == 0)
 	{
 		printf("RLIMIT_NOFILE nofile_rlim.rlim_cur %lu nofile_rlim.rlim_max %lu\n", nofile_rlim.rlim_cur, nofile_rlim.rlim_max);
@@ -41,24 +43,21 @@ static void limit_set()
 	}
 }
 
-static void *myconnect(void *ptr)
+static void myconnect(uint32_t *sockfd, uint16_t port)
 {
-	int sockfd;
-	uint16_t port;
-	struct sockaddr_in servaddr, cli;
-
-	port = *(uint16_t *)ptr;
-	//printf("connected to port %d..\n", port);
+	struct sockaddr_in servaddr;
 
 	// socket create and verification
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd == -1)
+	*sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (*sockfd == -1)
 	{
 		printf("Port %d socket creation failed. errno:%u, reason:%s\n", port, errno, strerror(errno));
-		return NULL;
+		exit(-1);
 	}
 
 	memset(&servaddr, 0, sizeof(servaddr));
+
+	fcntl(*sockfd, F_SETFL, fcntl(*sockfd, F_GETFL) | O_NONBLOCK);
 
 	// assign IP, PORT
 	servaddr.sin_family = AF_INET;
@@ -66,22 +65,94 @@ static void *myconnect(void *ptr)
 	servaddr.sin_port = htons(port);
 
 	// connect the client socket to server socket
-	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) != 0)
+	if (connect(*sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) != 0)
 	{
-		printf("Port %d connection with the server failed. errno:%u, reason:%s\n", port, errno, strerror(errno));
-		return NULL;
+		if (errno != EINPROGRESS)
+		{
+			printf("Port %d connection with the server failed. errno:%u, reason:%s\n", port, errno, strerror(errno));
+			exit(-1);
+		}
 	}
 	else
 		printf("connected to the server [%s:%d]\n", ip_addr, port);
+}
 
-	// close the socket
-	close(sockfd);
+static void port_detect(uint32_t *sockfd, uint16_t min_port, uint16_t len)
+{
+	uint32_t event_count;
+	uint32_t port_event = 0;
+	struct epoll_event event, events[len];
+	int epoll_fd = epoll_create1(0);
+
+	if (epoll_fd == -1)
+	{
+		printf("Failed to create epoll file descriptor. errno:%u, reason:%s\n", errno, strerror(errno));
+		exit(-1);
+	}
+	else
+	{
+		printf("create epoll file descriptor success %d\n", epoll_fd);
+	}
+
+	for (int i = 0; i < len; i++)
+	{
+		memset(&event, 0, sizeof(event));
+		event.events = EPOLLIN | EPOLLOUT;
+		event.data.fd = sockfd[i];
+
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event.data.fd, &event))
+		{
+			printf("Failed to add file descriptor to epoll. errno:%u, reason:%s\n", errno, strerror(errno));
+			printf("add file descriptor to epoll fail %d EEXIST %d\n", event.data.fd, EEXIST);
+			close(epoll_fd);
+			exit(-1);
+		}
+		else
+		{
+			port_event++;
+			// printf("add file descriptor to epoll success %d\n", event.data.fd);
+		}
+	}
+
+	do
+	{
+		printf("\nPolling for input...\n");
+		event_count = epoll_wait(epoll_fd, events, len, -1);
+		printf("%d ready events\n", event_count);
+		for (int i = 0; i < event_count; i++)
+		{
+			if (events[i].events & (EPOLLERR | EPOLLHUP))
+			{
+				epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]);
+				port_event--;
+				continue;
+			}
+			else if (events[i].events & EPOLLOUT)
+			{
+				for (int j = 0; j < len; j++)
+				{
+					if (events[i].data.fd == sockfd[j])
+					{
+						port_event--;
+						epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]);
+						printf("connected to the server [%s:%d]\n", ip_addr, j + min_port);
+						break;
+					}
+				}
+			} 
+		}
+	} while (port_event);
+
+	if (close(epoll_fd))
+	{
+		printf("Failed to close epoll file descriptor. errno:%u, reason:%s\n", errno, strerror(errno));
+		exit(-1);
+	}
 }
 
 int main(int argc, char *argv[])
 {
-	pthread_t *thread;
-	uint16_t *port;
+	uint32_t *sockfd;
 	uint16_t len, min_port, max_port;
 
 	if (argc != 4)
@@ -93,40 +164,21 @@ int main(int argc, char *argv[])
 	ip_addr = argv[1];
 	min_port = atoi(argv[2]);
 	max_port = atoi(argv[3]);
-	len = max_port - min_port;
-	thread = malloc(sizeof(pthread_t) * len);
-	port = malloc(sizeof(uint16_t) * len);
+	len = max_port - min_port + 1;
+	sockfd = malloc(sizeof(uint32_t) * len);
 
 	limit_set();
 
 	/* Create independent threads each of which will execute function */
 
-	for (int i = 0; i <= len; i++)
+	for (int i = 0; i < len; i++)
 	{
-		port[i] = i + min_port;
-		while (true)
-		{
-			if (pthread_create(&(thread[i]), NULL, myconnect, (void *)&(port[i])) != 0)
-			{
-				printf("Port %d pthread_create failed. errno:%u, reason:%s\n", i + min_port, errno, strerror(errno));
-				continue;
-				return 1;
-			}
-			else{
-				break;
-			}
-		}
+		myconnect(&sockfd[i], i + min_port);
+		// printf("socket create success %d\n", sockfd[i]);
 	}
-	printf("pthread_create ok...\n");
 
-	/* Wait till threads are complete before main continues. Unless we  */
-	/* wait we run the risk of executing an exit which will terminate   */
-	/* the process and all threads before the threads have completed.   */
-	for (int i = 0; i <= len; i++)
-	{
-		pthread_join(thread[i], NULL);
-	}
-	free(thread);
-	free(port);
+	port_detect(sockfd, min_port, len);
+
+	free(sockfd);
 	return 0;
 }
